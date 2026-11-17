@@ -1,22 +1,15 @@
 import torch
 from transformers import AutoConfig, AutoImageProcessor
-from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionConfig, Qwen3VLVisionModel
 
 from llm_img_reverse.vision import MODEL_ID, encode, to_pixel_values
 
 
-def test_encode_matches_hf_forward():
-    # A small randomly initialized tower with the real layout; encode reimplements its forward.
-    config = Qwen3VLVisionConfig(
-        depth=5, hidden_size=64, intermediate_size=128, num_heads=4, out_hidden_size=96,
-        num_position_embeddings=64, deepstack_visual_indexes=[1, 3],
-    )
-    config._attn_implementation = "sdpa"
-    torch.manual_seed(0)
-    model = Qwen3VLVisionModel(config).eval()
+def test_encode_matches_hf_forward(tiny_tower):
+    # encode reimplements Qwen3VLVisionModel.forward so it can stop early; it must agree with it.
+    model = tiny_tower
     image = torch.rand(3, 64, 96)
 
-    main, deepstack = model(*to_pixel_values(image, config))
+    main, deepstack = model(*to_pixel_values(image, model.config))
     tokens = encode(model, image)
     assert list(tokens) == ["main", "ds1", "ds3"]
     for actual, expected in zip(tokens.values(), [main, *deepstack]):

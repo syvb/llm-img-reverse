@@ -72,7 +72,7 @@ PARAMETERIZATIONS = {"fourier": FourierImage, "pixel": PixelImage}
 
 def invert(
     model, targets, shape, weights, steps=300, optimizer="lbfgs", lr=None, tv=0.0, param="fourier", seed=0,
-    log_every=25, log=print,
+    log_every=25, log=lambda line: print(line, flush=True),
 ):
     """Find a [3, H, W] image in [0, 1] whose soft tokens match `targets` on the weighted streams.
 
