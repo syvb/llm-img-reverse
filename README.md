@@ -3,6 +3,10 @@
 Running Qwen3-VL-8B's vision stack backwards: given the soft tokens the vision tower produces for an
 image, optimize a new image until its soft tokens match them, and look at what comes back.
 
+Try it on a GPU in the [Hugging Face Space](https://huggingface.co/spaces/syvb/qwen3-vl-soft-token-inversion)
+(ZeroGPU; 300 evaluations take about 10 s once it is warm). `space/` holds the app, and
+`HF_TOKEN=... python space/deploy.py <owner>/<space>` deploys it.
+
 ## What gets inverted
 
 For each 32×32 block of pixels, the vision tower of [Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct)
