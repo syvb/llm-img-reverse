@@ -72,11 +72,12 @@ PARAMETERIZATIONS = {"fourier": FourierImage, "pixel": PixelImage}
 
 def invert(
     model, targets, shape, weights, steps=300, optimizer="lbfgs", lr=None, tv=0.0, param="fourier", seed=0,
-    log_every=25, log=lambda line: print(line, flush=True),
+    log_every=25, log=lambda line: print(line, flush=True), on_eval=None,
 ):
     """Find a [3, H, W] image in [0, 1] whose soft tokens match `targets` on the weighted streams.
 
     `steps` counts evaluations of the vision tower (forward and backward), for either optimizer.
+    `on_eval(image, loss)` is called after each one; with L-BFGS this includes line-search trials.
     """
     image_fn = PARAMETERIZATIONS[param](shape, torch.Generator().manual_seed(seed))
     history = []
@@ -92,6 +93,8 @@ def invert(
         history.append({"eval": evaluation, "loss": loss.item(), **{k: v.item() for k, v in errors.items()}})
         if evaluation % log_every == 0:
             log(" ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in history[-1].items()))
+        if on_eval:
+            on_eval(image.detach(), loss.item())
         return loss
 
     if optimizer == "lbfgs":
@@ -159,6 +162,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save-tokens", type=Path, help="write the target tokens of an image input here")
     parser.add_argument("--threads", type=int, help="torch CPU threads")
+    parser.add_argument("--save-frames", action="store_true", help="save every evaluated image to frames.pt")
     args = parser.parse_args()
 
     if args.threads:
@@ -178,10 +182,19 @@ def main():
     weights = parse_streams(args.streams, stream_names(model))
 
     args.out.mkdir(parents=True, exist_ok=True)
+    frames, losses = [], []
+
+    def record(image, loss):
+        frames.append((image.clamp(0, 1) * 255).round().to(torch.uint8))
+        losses.append(loss)
+
     start = time.time()
     image, history = invert(
-        model, targets, shape, weights, args.steps, args.optimizer, args.lr, args.tv, args.param, args.seed
+        model, targets, shape, weights, args.steps, args.optimizer, args.lr, args.tv, args.param, args.seed,
+        on_eval=record if args.save_frames else None,
     )
+    if args.save_frames:
+        torch.save({"frames": torch.stack(frames), "losses": torch.tensor(losses)}, args.out / "frames.pt")
     metrics = {
         "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "seconds": round(time.time() - start, 1),
