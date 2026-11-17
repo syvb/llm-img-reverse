@@ -1,0 +1,23 @@
+[project]
+name = "llm-img-reverse"
+version = "0.1.0"
+description = "Invert Qwen3-VL vision soft tokens back into images"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.5",
+    "transformers>=4.57,<5",
+    "safetensors",
+    "huggingface_hub",
+    "pillow",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "torchvision"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["llm_img_reverse"]
