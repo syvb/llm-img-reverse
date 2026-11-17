@@ -47,13 +47,14 @@ class FourierImage(torch.nn.Module):
         c, h, w = shape
         freqs = (torch.fft.fftfreq(h)[:, None] ** 2 + torch.fft.rfftfreq(w)[None] ** 2).sqrt()
         self.register_buffer("scale", 1 / freqs.clamp(min=1 / max(h, w)))
+        self.register_buffer("color", COLOR_SQRT.clone())
         self.spectrum = torch.nn.Parameter(0.01 * torch.randn(c, h, w // 2 + 1, 2, generator=generator))
         self.size = (h, w)
 
     def forward(self):
         spectrum = torch.view_as_complex(self.spectrum) * self.scale
         image = torch.fft.irfft2(spectrum, s=self.size, norm="ortho")
-        return torch.sigmoid(torch.einsum("ij,jhw->ihw", COLOR_SQRT, image))
+        return torch.sigmoid(torch.einsum("ij,jhw->ihw", self.color, image))
 
 
 class PixelImage(torch.nn.Module):
@@ -79,7 +80,9 @@ def invert(
     `steps` counts evaluations of the vision tower (forward and backward), for either optimizer.
     `on_eval(image, loss)` is called after each one; with L-BFGS this includes line-search trials.
     """
-    image_fn = PARAMETERIZATIONS[param](shape, torch.Generator().manual_seed(seed))
+    # Initialized on the CPU generator so a seed gives the same start on every device.
+    device = next(iter(targets.values())).device
+    image_fn = PARAMETERIZATIONS[param](shape, torch.Generator().manual_seed(seed)).to(device)
     history = []
 
     def closure():
