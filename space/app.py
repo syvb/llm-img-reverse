@@ -22,11 +22,13 @@ from llm_img_reverse.vision import encode, load_image, load_vision_tower, stream
 DEVICE = "cuda" if os.getenv("SPACES_ZERO_GPU") or torch.cuda.is_available() else "cpu"
 torch.set_float32_matmul_precision("high")
 MODEL = load_vision_tower(device=DEVICE)
-# Per-dimension mean and standard deviation of each stream's tokens over COCO photos, from
-# experiments/token_stats.py.
+# Statistics of each stream's tokens over COCO photos, from experiments/token_stats.py: per-dimension
+# mean and std, and the top principal components with their variances and neighbor correlations.
 STATS = torch.load(Path(__file__).with_name("token_stats.pt"))
 
-IMAGE, RANDOM = "Encode an image", "Random: the mean token plus noise"
+IMAGE = "Encode an image"
+RANDOM = "Random, independent: the mean token plus noise"
+CORRELATED = "Random, correlated like real tokens (PCA)"
 STREAMS = {
     "ds8: DeepStack after vision block 8": "ds8",
     "ds16: DeepStack after vision block 16": "ds16",
@@ -96,6 +98,25 @@ def random_targets(streams, size, noise, seed):
     }
 
 
+def correlated_targets(streams, size, noise, seed):
+    """Target tokens on the matched streams for a size x size image, from a Gaussian fitted to real
+    tokens: the mean token plus the top principal components, each at `noise` times its standard
+    deviation. Each component's coefficients form a random field over the token grid whose correlation
+    between neighbors matches COCO photos and falls off as correlation ** distance."""
+    generator = torch.Generator().manual_seed(seed)
+    side = size // 32
+    cells = torch.cartesian_prod(torch.arange(side), torch.arange(side)).double()  # row-major, like tokens
+    distance = torch.cdist(cells, cells)
+    targets = {}
+    for name in parse_streams(streams, stream_names(MODEL)):
+        correlation = STATS["neighbor_correlation"][name].double().clamp(0, 0.99)
+        field = torch.linalg.cholesky(correlation[:, None, None] ** distance)  # [components, tokens, tokens]
+        white = torch.randn(len(correlation), side * side, 1, dtype=torch.float64, generator=generator)
+        coefficients = (field @ white)[..., 0].T.float() * STATS["variance"][name].sqrt()  # [tokens, components]
+        targets[name] = STATS["mean"][name] + noise * coefficients @ STATS["components"][name].float()
+    return targets
+
+
 def reconstruct(target, path, noise, seed, streams_label, steps, size):
     size, steps, streams = int(size), int(steps), STREAMS[streams_label]
     original = targets = None
@@ -104,7 +125,7 @@ def reconstruct(target, path, noise, seed, streams_label, steps, size):
             raise gr.Error("Upload an image or pick an example first.")
         original = load_image(path, size, size)
     else:
-        targets = random_targets(streams, size, noise, int(seed))
+        targets = (random_targets if target == RANDOM else correlated_targets)(streams, size, noise, int(seed))
     # (best image so far, its loss, evaluation) at every stride-th evaluation, for the video
     stride, samples, count = -(-steps // VIDEO_FRAMES), [], 0
     start = time.time()
@@ -129,8 +150,13 @@ def reconstruct(target, path, noise, seed, streams_label, steps, size):
     if original is not None:
         gray = psnr(torch.full_like(original, 0.5), original)
         score = f"**PSNR {psnr(best.float() / 255, original):.1f} dB** (a flat gray image scores {gray:.1f})."
-    else:
+    elif target == RANDOM:
         score = f"**Random target tokens**: the mean token plus noise of {noise:g} × the spread of real tokens, seed {int(seed)}."
+    else:
+        score = (
+            f"**Correlated random target tokens**: the mean token plus the top {len(STATS['variance']['main'])} principal "
+            f"components at {noise:g} × their spread, correlated between neighboring tokens like COCO photos, seed {int(seed)}."
+        )
     rows = "\n".join(
         f"| {name}{' (matched)' if streams in (name, 'all') else ''} | {m['cosine']:.3f} | {m['relative_error']:.3f} |"
         for name, m in metrics.items()
@@ -142,7 +168,8 @@ def reconstruct(target, path, noise, seed, streams_label, steps, size):
         f"| stream | token cosine | relative error |\n|---|---|---|\n{rows}"
     )
     video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-    names = ["original", streams] if original is not None else [f"{streams}, random tokens"]
+    kind = "random" if target == RANDOM else "correlated random"
+    names = ["original", streams] if original is not None else [f"{streams}, {kind} tokens"]
     write_video(video, original, names, [(torch.stack(frames), list(losses))], list(evaluations))
     yield as_html(best), summary, video
 
@@ -154,13 +181,14 @@ with gr.Blocks(title="Qwen3-VL soft-token inversion") as demo:
         "[Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct), then start from a gray "
         "image and optimize it with L-BFGS until its soft tokens match. Watch what the tokens keep. "
         "DeepStack layer 8 usually gives a photo back; the final tokens alone usually stay gray. "
-        "Or start from random tokens: the average token of 200 COCO photos plus Gaussian noise, scaled in "
-        "each of the 4096 dimensions by how much real tokens vary there. "
+        "Or start from random tokens, built from the tokens of 200 COCO photos: either their average token "
+        "plus Gaussian noise, scaled in each of the 4096 dimensions by how much real tokens vary there, or a "
+        "sample along their top principal components, correlated between neighboring tokens like a photo's. "
         "Code and findings: [syvb/llm-img-reverse](https://github.com/syvb/llm-img-reverse)."
     )
     with gr.Row():
         with gr.Column():
-            target_in = gr.Radio([IMAGE, RANDOM], value=IMAGE, label="Target tokens")
+            target_in = gr.Radio([IMAGE, RANDOM, CORRELATED], value=IMAGE, label="Target tokens")
             image_in = gr.Image(type="filepath", label="Image (center-cropped to a square)")
             with gr.Row(visible=False) as random_in:
                 noise_in = gr.Slider(0, 2, value=1, step=0.05, label="Noise, in standard deviations of real tokens")
@@ -178,7 +206,7 @@ with gr.Blocks(title="Qwen3-VL soft-token inversion") as demo:
             video_out = gr.Video(label="Optimization", show_label=False)  # the label would cover the tile titles
     gr.Examples([f"examples/{name}.png" for name in ["chelsea", "coffee", "astronaut", "testcard"]], inputs=image_in)
     target_in.change(
-        lambda target: (gr.update(visible=target == IMAGE), gr.update(visible=target == RANDOM)),
+        lambda target: (gr.update(visible=target == IMAGE), gr.update(visible=target != IMAGE)),
         target_in, [image_in, random_in],
     )
     run.click(

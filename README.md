@@ -5,9 +5,9 @@ image, optimize a new image until its soft tokens match them, and look at what c
 
 Try it on a GPU in the [Hugging Face Space](https://huggingface.co/spaces/syvb/qwen3-vl-soft-token-inversion)
 (ZeroGPU; 300 evaluations take about 10 s once it is warm). Besides an image's tokens, it can
-invert random tokens: the mean token of 200 COCO photos plus Gaussian noise, scaled in each dimension
-by the spread of real tokens, which `experiments/token_stats.py` measures. `space/` holds the app,
-and `HF_TOKEN=... python space/deploy.py <owner>/<space>` deploys it.
+invert random tokens built from statistics of 200 COCO photos' tokens, which
+`experiments/token_stats.py` measures (see [Random targets](#random-targets)). `space/` holds the
+app, and `HF_TOKEN=... python space/deploy.py <owner>/<space>` deploys it.
 
 ## What gets inverted
 
@@ -112,6 +112,24 @@ main hard. Adding 2% pixel noise changes main about 2 to 4 times as much as it c
 DeepStack streams, and 8 of main's 64 tokens hold 40 to 60% of its energy. One explanation, which
 these runs have not tested, is that local search finds noise-like changes that move main faster
 than real image content does.
+
+## Random targets
+
+The Space can invert random tokens instead of an image's, in two ways:
+
+- **Independent:** the mean token plus Gaussian noise, scaled in each dimension by the spread of real tokens.
+- **Correlated:** a sample from a Gaussian fitted to real tokens. It uses their top 64 principal
+  components, and each component's coefficients vary across the token grid with the correlation
+  that neighboring tokens have in photos (falling off as correlation^distance).
+
+Matching ds8, both turn into low-contrast texture, not images. Correlated targets are easier to
+reach: after 300 GPU evaluations, four samples ended at relative error 0.44 to 0.55, against 0.87
+for one independent sample.
+
+Image content lives in the low-variance directions. The top 16, 64 and 256 components hold 42%, 59%
+and 75% of ds8's variance, and neighboring tokens correlate only 0.27 overall. Projecting the cat's
+ds8 tokens onto the top 64 or 256 components and inverting that for 120 evaluations gives 15.5 or
+16.2 dB, close to flat gray at 15.0, against 21.4 dB from the full tokens.
 
 ## CPU notes
 
