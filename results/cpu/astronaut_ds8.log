@@ -11,7 +11,7 @@ eval=250 loss=0.03075 ds8=0.03075
 eval=275 loss=0.02861 ds8=0.02861
 eval=300 loss=0.02666 ds8=0.02666
 {
-  "seconds": 175.4,
+  "seconds": 167.0,
   "psnr": 12.728567123413086,
   "tokens": {
     "main": {

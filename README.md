@@ -66,9 +66,14 @@ is the PSNR of a flat gray image, the score of a reconstruction that recovered n
 ![Coffee](results/cpu/coffee.png)
 
 Videos of the optimizations, one frame per evaluation at 30 fps, show each run's lowest-loss image
-so far with its PSNR and loss: [test card](results/cpu/testcard.mp4),
-[cat](results/cpu/chelsea.mp4), [astronaut](results/cpu/astronaut.mp4),
-[coffee](results/cpu/coffee.mp4).
+so far with its PSNR and loss: [test card](https://huggingface.co/buckets/syvb/llm-img-reverse/resolve/cpu/testcard.mp4),
+[cat](https://huggingface.co/buckets/syvb/llm-img-reverse/resolve/cpu/chelsea.mp4),
+[astronaut](https://huggingface.co/buckets/syvb/llm-img-reverse/resolve/cpu/astronaut.mp4),
+[coffee](https://huggingface.co/buckets/syvb/llm-img-reverse/resolve/cpu/coffee.mp4). They live in
+the [`syvb/llm-img-reverse`](https://huggingface.co/buckets/syvb/llm-img-reverse) storage bucket
+rather than git; after a sweep, upload them with a current `hf` CLI (the repo's transformers pins an
+older `huggingface_hub`):
+`uvx --from huggingface_hub hf buckets sync results/cpu hf://buckets/syvb/llm-img-reverse/cpu --include '*.mp4'`.
 
 | image | matched | PSNR (dB) | gray (dB) | main error |
 |---|---|---|---|---|

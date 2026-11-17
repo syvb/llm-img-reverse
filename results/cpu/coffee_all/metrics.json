@@ -11,9 +11,10 @@
     "param": "fourier",
     "seed": 0,
     "save_tokens": null,
-    "threads": null
+    "threads": null,
+    "save_frames": true
   },
-  "seconds": 444.1,
+  "seconds": 434.5,
   "tokens": {
     "main": {
       "relative_error": 0.5227175354957581,
