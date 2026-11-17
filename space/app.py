@@ -1,5 +1,7 @@
 """Hugging Face Space: reconstruct an image from Qwen3-VL's soft tokens, live."""
 
+import base64
+import io
 import os
 import queue
 import tempfile
@@ -9,6 +11,7 @@ import time
 import gradio as gr
 import spaces
 import torch
+from PIL import Image
 
 from llm_img_reverse.invert import invert, parse_streams, psnr, token_metrics
 from llm_img_reverse.video import write_video
@@ -26,7 +29,7 @@ STREAMS = {
     "main: final soft tokens (the LLM's input)": "main",
     "all four": "all",
 }
-PREVIEW_EVERY = 5
+PREVIEW_SECONDS = 0.25
 
 
 def gpu_seconds(original, streams, steps):
@@ -63,8 +66,13 @@ def optimize(original, streams, steps):
             return
 
 
-def as_array(frame):
-    return frame.permute(1, 2, 0).numpy()
+def as_html(frame):
+    """The image inline as a data URL. A gr.Image output makes the browser download each update as a
+    file, and at GPU speed every download was replaced before it finished, so the preview froze."""
+    buffer = io.BytesIO()
+    Image.fromarray(frame.permute(1, 2, 0).numpy()).save(buffer, format="WEBP", quality=90)
+    data = base64.b64encode(buffer.getvalue()).decode()
+    return f'<img src="data:image/webp;base64,{data}" style="display: block; width: 100%; max-width: 384px; margin: auto">'
 
 
 def reconstruct(path, streams_label, steps, size):
@@ -74,6 +82,7 @@ def reconstruct(path, streams_label, steps, size):
     streams, steps = STREAMS[streams_label], int(steps)
     frames, losses, best = [], [], 0
     start = time.time()
+    last_preview = start - PREVIEW_SECONDS  # show the first frame right away
     for item in optimize(original, streams, steps):
         if isinstance(item, dict):
             metrics = item
@@ -81,8 +90,9 @@ def reconstruct(path, streams_label, steps, size):
         frames.append(item[0])
         losses.append(item[1])
         best = len(losses) - 1 if losses[-1] < losses[best] else best
-        if len(frames) % PREVIEW_EVERY == 1:
-            yield as_array(frames[best]), f"Evaluation {len(frames)} of {steps}, loss {losses[best]:.3f}", None
+        if time.time() - last_preview >= PREVIEW_SECONDS:
+            last_preview = time.time()
+            yield as_html(frames[best]), f"Evaluation {len(frames)} of {steps}, loss {losses[best]:.3f}", None
     seconds = time.time() - start
 
     image = frames[best].float() / 255
@@ -98,7 +108,7 @@ def reconstruct(path, streams_label, steps, size):
     )
     video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
     write_video(video, original, ["original", streams], [(torch.stack(frames), losses)])
-    yield as_array(frames[best]), summary, video
+    yield as_html(frames[best]), summary, video
 
 
 with gr.Blocks(title="Qwen3-VL soft-token inversion") as demo:
@@ -118,7 +128,7 @@ with gr.Blocks(title="Qwen3-VL soft-token inversion") as demo:
             size_in = gr.Radio([256, 384], value=256, label="Size in pixels (64 or 144 tokens)")
             run = gr.Button("Reconstruct", variant="primary")
         with gr.Column():
-            image_out = gr.Image(label="Reconstruction (best so far)")
+            image_out = gr.HTML(label="Reconstruction (best so far)", show_label=True, container=True, min_height=300)
             status = gr.Markdown()
             video_out = gr.Video(label="Optimization")
     gr.Examples([f"examples/{name}.png" for name in ["chelsea", "coffee", "astronaut", "testcard"]], inputs=image_in)
