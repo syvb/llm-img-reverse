@@ -43,11 +43,12 @@ python -m llm_img_reverse.invert chelsea.pt --streams all --out results/chelsea_
 
 Each run writes `reconstruction.png`, `comparison.png` (original next to the reconstruction, for
 image inputs) and `metrics.json` (PSNR, and the relative error and mean cosine similarity of every
-stream, including those that were not optimized). `--param pixel`, `--optimizer adam`, `--tv` and
-`--lr` switch to the baselines and regularizers.
+stream, including those that were not optimized). `--save-frames` also saves every evaluated image
+to `frames.pt` (about 60 MB for 300 evaluations at 256×256). `--param pixel`, `--optimizer adam`,
+`--tv` and `--lr` switch to the baselines and regularizers.
 
 `experiments/cpu_sweep.sh` reruns the CPU tests below, and `experiments/summarize.py` builds the
-table and contact sheets from any directory of runs.
+table, contact sheets and videos from any directory of runs.
 
 ## CPU results
 
@@ -59,6 +60,11 @@ is the PSNR of a flat gray image, the score of a reconstruction that recovered n
 ![Cat](results/cpu/chelsea.png)
 ![Astronaut](results/cpu/astronaut.png)
 ![Coffee](results/cpu/coffee.png)
+
+Videos of the optimizations, one frame per evaluation at 30 fps, show each run's lowest-loss image
+so far with its PSNR and loss: [test card](results/cpu/testcard.mp4),
+[cat](results/cpu/chelsea.mp4), [astronaut](results/cpu/astronaut.mp4),
+[coffee](results/cpu/coffee.mp4).
 
 | image | matched | PSNR (dB) | gray (dB) | main error |
 |---|---|---|---|---|
