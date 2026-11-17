@@ -12,6 +12,11 @@ STRIP = 20  # caption strip height in pixels
 FPS, HOLD_SECONDS = 30, 2
 
 
+def run_name(streams):
+    """A run's title in videos, from the streams it matched: deepstack8 for ds8, and so on."""
+    return streams.replace("ds", "deepstack")
+
+
 def sheet(tiles, names, captions=None):
     """[3, H, W] images in [0, 1] side by side, each name above its tile and each caption below it."""
     height, width = tiles[0].shape[1:]
@@ -47,15 +52,18 @@ def write_video(path, original, names, runs, evaluations=None):
          str(path)],
         stdin=subprocess.PIPE,
     )
+
+    def progress(last):
+        return f"evaluation {labels[last]} / {labels[-1]}"
+
     for n in range(count + FPS * HOLD_SECONDS):
-        progress = f"evaluation {labels[min(n, count - 1)]} / {labels[-1]}"
-        tiles, captions = ([original], [progress]) if original is not None else ([], [])
+        tiles, captions = ([original], [progress(min(n, count - 1))]) if original is not None else ([], [])
         for (frames, losses), indices in zip(runs, best_index):
-            i = indices[min(n, len(indices) - 1)]
-            tile = frames[i].float() / 255
+            last = min(n, len(indices) - 1)  # a run that ended early holds its last frame
+            tile = frames[indices[last]].float() / 255
             tiles.append(tile)
-            score = f"{psnr(tile, original):.1f} dB" if original is not None else progress
-            captions.append(f"{score}, loss {float(losses[i]):.3f}")
+            score = f"{psnr(tile, original):.1f} dB" if original is not None else progress(last)
+            captions.append(f"{score}, loss {float(losses[indices[last]]):.3f}")
         ffmpeg.stdin.write(sheet(tiles, names, captions).tobytes())
     ffmpeg.stdin.close()
     if ffmpeg.wait():

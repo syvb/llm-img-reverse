@@ -12,7 +12,7 @@ import torch
 
 from llm_img_reverse.invert import parse_size, psnr
 from llm_img_reverse.vision import load_image
-from llm_img_reverse.video import sheet, write_video
+from llm_img_reverse.video import run_name, sheet, write_video
 
 STREAM_ORDER = ["main", "ds8", "ds16", "ds24", "all"]
 
@@ -45,7 +45,10 @@ def main(root):
         frame_files = [by_streams[s][0] / "frames.pt" for s in ordered]
         if all(f.exists() for f in frame_files):
             recorded = [torch.load(f) for f in frame_files]
-            write_video(root / f"{image}.mp4", original, names, [(r["frames"], r["losses"].tolist()) for r in recorded])
+            write_video(
+                root / f"{image}.mp4", original, ["original", *map(run_name, ordered)],
+                [(r["frames"], r["losses"].tolist()) for r in recorded],
+            )
     (root / "summary.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
 

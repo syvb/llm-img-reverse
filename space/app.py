@@ -15,7 +15,7 @@ import torch
 from PIL import Image
 
 from llm_img_reverse.invert import invert, parse_streams, psnr, token_metrics
-from llm_img_reverse.video import write_video
+from llm_img_reverse.video import run_name, write_video
 from llm_img_reverse.vision import encode, load_image, load_vision_tower, stream_names
 
 # On ZeroGPU the model is placed on cuda at import time; a real GPU is attached inside @spaces.GPU.
@@ -29,86 +29,96 @@ STATS = torch.load(Path(__file__).with_name("token_stats.pt"))
 IMAGE = "Encode an image"
 RANDOM = "Random, independent: the mean token plus noise"
 CORRELATED = "Random, correlated like real tokens (PCA)"
-STREAMS = {
-    "ds8: DeepStack after vision block 8": "ds8",
-    "ds16: DeepStack after vision block 16": "ds16",
-    "ds24: DeepStack after vision block 24": "ds24",
+# Checkbox label -> the streams that one run matches.
+RUNS = {
+    "deepstack8: after vision block 8": "ds8",
+    "deepstack16: after vision block 16": "ds16",
+    "deepstack24: after vision block 24": "ds24",
     "main: final soft tokens (the LLM's input)": "main",
-    "all four": "all",
+    "all four, matched together": "all",
 }
 PREVIEW_SECONDS = 0.25
+# A compact summary table, so that its columns fit beside the inputs without breaking words.
+CSS = "#summary table { font-size: 13px } #summary th, #summary td { padding: 4px 6px; white-space: nowrap } #summary { overflow-x: auto }"
 VIDEO_FRAMES = 600  # longer runs are sampled down to this many video frames
 
 
-def gpu_seconds(size, streams, steps, original=None, targets=None):
-    """GPU time to reserve for one run: 15 s to start, plus 1.5 times what an evaluation took on the
-    Space, about 30 ms up to block 8 and 50 ms (256 px) or 75 ms (384 px) through the whole tower."""
-    per_eval = 0.03 if streams == "ds8" else 0.05 if size == 256 else 0.075
+def gpu_seconds(size, runs, steps, original=None, targets=None):
+    """GPU time to reserve: 15 s to start, plus 1.5 times what an evaluation took on the Space, about
+    30 ms up to block 8 and 50 ms (256 px) or 75 ms (384 px) through the whole tower, for every run."""
+    per_eval = sum(0.03 if streams == "ds8" else 0.05 if size == 256 else 0.075 for streams in runs)
     return int(15 + 1.5 * steps * per_eval)
 
 
 @spaces.GPU(duration=gpu_seconds)
-def optimize(size, streams, steps, original=None, targets=None):
-    """Yield (uint8 frame, loss) after each evaluation, then a dict of token metrics. The target tokens
-    are those of the image `original`, or `targets` when there is no image."""
+def optimize(size, runs, steps, original=None, targets=None):
+    """Run one inversion per entry of `runs`, the streams it matches such as "ds8" or "all", one after
+    another. Yield (run, uint8 frame, loss) after each evaluation and (run, dict of token metrics) when a
+    run ends. The target tokens are those of the image `original`, or `targets` when there is no image."""
     with torch.no_grad():
         if original is not None:
             targets = encode(MODEL, original.to(DEVICE))
         targets = {name: tokens.to(DEVICE) for name, tokens in targets.items()}
-    weights = parse_streams(streams, stream_names(MODEL))
     updates = queue.Queue()
-
-    def record(image, loss):
-        updates.put(((image.clamp(0, 1) * 255).round().to(torch.uint8).cpu(), loss))
 
     def work():
         try:
-            image, _ = invert(MODEL, targets, (3, size, size), weights, steps, on_eval=record)
-            updates.put(token_metrics(MODEL, image, targets))
+            for run, streams in enumerate(runs):
+                def record(image, loss):
+                    updates.put((run, (image.clamp(0, 1) * 255).round().to(torch.uint8).cpu(), loss))
+
+                weights = parse_streams(streams, stream_names(MODEL))
+                image, _ = invert(MODEL, targets, (3, size, size), weights, steps, on_eval=record)
+                updates.put((run, token_metrics(MODEL, image, targets)))
+            updates.put(None)
         except Exception as error:  # surfaced in the generator below
             updates.put(error)
 
     threading.Thread(target=work, daemon=True).start()
-    while True:
-        item = updates.get()
+    while (item := updates.get()) is not None:
         if isinstance(item, Exception):
             raise item
         yield item
-        if isinstance(item, dict):
-            return
 
 
-def as_html(frame):
-    """The image inline as a data URL. A gr.Image output makes the browser download each update as a
-    file, and at GPU speed every download was replaced before it finished, so the preview froze."""
-    buffer = io.BytesIO()
-    Image.fromarray(frame.permute(1, 2, 0).numpy()).save(buffer, format="WEBP", quality=90)
-    data = base64.b64encode(buffer.getvalue()).decode()
-    return f'<img src="data:image/webp;base64,{data}" style="display: block; width: 100%; max-width: 384px; margin: auto">'
+def as_html(tiles):
+    """(label, uint8 image or None) tiles side by side, the images inline as data URLs. A gr.Image
+    output makes the browser download each update as a file, and at GPU speed every download was
+    replaced before it finished, so the preview froze."""
+    cells = []
+    for label, frame in tiles:
+        image = '<div style="aspect-ratio: 1; background: #8882"></div>'  # a run that has not started
+        if frame is not None:
+            buffer = io.BytesIO()
+            Image.fromarray(frame.permute(1, 2, 0).numpy()).save(buffer, format="WEBP", quality=90)
+            data = base64.b64encode(buffer.getvalue()).decode()
+            image = f'<img src="data:image/webp;base64,{data}" style="display: block; width: 100%">'
+        cells.append(f'<div style="flex: 1; max-width: 384px; text-align: center; font-size: 13px">{label}{image}</div>')
+    return f'<div style="display: flex; gap: 8px; justify-content: center">{"".join(cells)}</div>'
 
 
-def random_targets(streams, size, noise, seed):
-    """Target tokens on the matched streams for a size x size image: the mean token of COCO photos
-    plus Gaussian noise, scaled in each dimension by `noise` times the spread of real tokens."""
+def random_targets(size, noise, seed):
+    """Target tokens on every stream for a size x size image: the mean token of COCO photos plus
+    Gaussian noise, scaled in each dimension by `noise` times the spread of real tokens."""
     generator = torch.Generator().manual_seed(seed)
     count = (size // 32) ** 2
     return {
         name: STATS["mean"][name] + noise * STATS["std"][name] * torch.randn(count, len(STATS["mean"][name]), generator=generator)
-        for name in parse_streams(streams, stream_names(MODEL))
+        for name in stream_names(MODEL)
     }
 
 
-def correlated_targets(streams, size, noise, seed):
-    """Target tokens on the matched streams for a size x size image, from a Gaussian fitted to real
-    tokens: the mean token plus the top principal components, each at `noise` times its standard
-    deviation. Each component's coefficients form a random field over the token grid whose correlation
-    between neighbors matches COCO photos and falls off as correlation ** distance."""
+def correlated_targets(size, noise, seed):
+    """Target tokens on every stream for a size x size image, from a Gaussian fitted to real tokens:
+    the mean token plus the top principal components, each at `noise` times its standard deviation.
+    Each component's coefficients form a random field over the token grid whose correlation between
+    neighbors matches COCO photos and falls off as correlation ** distance."""
     generator = torch.Generator().manual_seed(seed)
     side = size // 32
     cells = torch.cartesian_prod(torch.arange(side), torch.arange(side)).double()  # row-major, like tokens
     distance = torch.cdist(cells, cells)
     targets = {}
-    for name in parse_streams(streams, stream_names(MODEL)):
+    for name in stream_names(MODEL):
         correlation = STATS["neighbor_correlation"][name].double().clamp(0, 0.99)
         field = torch.linalg.cholesky(correlation[:, None, None] ** distance)  # [components, tokens, tokens]
         white = torch.randn(len(correlation), side * side, 1, dtype=torch.float64, generator=generator)
@@ -117,61 +127,80 @@ def correlated_targets(streams, size, noise, seed):
     return targets
 
 
-def reconstruct(target, path, noise, seed, streams_label, steps, size):
-    size, steps, streams = int(size), int(steps), STREAMS[streams_label]
+def reconstruct(target, path, noise, seed, run_labels, steps, size):
+    runs = [streams for label, streams in RUNS.items() if label in run_labels]
+    if not runs:
+        raise gr.Error("Check at least one set of soft tokens to match.")
+    size, steps = int(size), int(steps)
     original = targets = None
     if target == IMAGE:
         if path is None:
             raise gr.Error("Upload an image or pick an example first.")
         original = load_image(path, size, size)
     else:
-        targets = (random_targets if target == RANDOM else correlated_targets)(streams, size, noise, int(seed))
-    # (best image so far, its loss, evaluation) at every stride-th evaluation, for the video
-    stride, samples, count = -(-steps // VIDEO_FRAMES), [], 0
+        targets = (random_targets if target == RANDOM else correlated_targets)(size, noise, int(seed))
+    names = [run_name(streams) for streams in runs]
+    first = [("original", (original * 255).round().to(torch.uint8))] if original is not None else []
+    # Per run: the best image so far, its loss, the evaluations so far, the token metrics at the end,
+    # and (best image so far, its loss, evaluation) at every stride-th evaluation, for the video.
+    best, best_loss, count, metrics = [None] * len(runs), [None] * len(runs), [0] * len(runs), [None] * len(runs)
+    stride, samples = -(-steps // VIDEO_FRAMES), [[] for _ in runs]
     start = time.time()
     last_preview = start - PREVIEW_SECONDS  # show the first frame right away
-    for item in optimize(size, streams, steps, original=original, targets=targets):
-        if isinstance(item, dict):
-            metrics = item
-            break
-        count += 1
-        if count == 1 or item[1] < best_loss:
-            best, best_loss = item
-        if (count - 1) % stride == 0:
-            samples.append((best, best_loss, count))
+    for run, *item in optimize(size, runs, steps, original=original, targets=targets):
+        if len(item) == 1:  # the run ended
+            metrics[run] = item[0]
+            if samples[run][-1][2] != count[run]:
+                samples[run].append((best[run], best_loss[run], count[run]))
+            continue
+        frame, loss = item
+        count[run] += 1
+        if count[run] == 1 or loss < best_loss[run]:
+            best[run], best_loss[run] = frame, loss
+        if (count[run] - 1) % stride == 0:
+            samples[run].append((best[run], best_loss[run], count[run]))
         if time.time() - last_preview >= PREVIEW_SECONDS:
             last_preview = time.time()
-            yield as_html(best), f"Evaluation {count} of {steps}, loss {best_loss:.3f}", None
+            status = f"Run {run + 1} of {len(runs)}, {names[run]}: evaluation {count[run]} of {steps}, loss {best_loss[run]:.3f}"
+            yield as_html(first + list(zip(names, best))), status, None
     seconds = time.time() - start
-    if samples[-1][2] != count:
-        samples.append((best, best_loss, count))
-    frames, losses, evaluations = zip(*samples)
 
     if original is not None:
-        gray = psnr(torch.full_like(original, 0.5), original)
-        score = f"**PSNR {psnr(best.float() / 255, original):.1f} dB** (a flat gray image scores {gray:.1f})."
+        header = f"PSNR against the original; a flat gray image scores {psnr(torch.full_like(original, 0.5), original):.1f} dB."
     elif target == RANDOM:
-        score = f"**Random target tokens**: the mean token plus noise of {noise:g} × the spread of real tokens, seed {int(seed)}."
+        header = f"**Random target tokens**: the mean token plus noise of {noise:g} × the spread of real tokens, seed {int(seed)}."
     else:
-        score = (
+        header = (
             f"**Correlated random target tokens**: the mean token plus the top {len(STATS['variance']['main'])} principal "
             f"components at {noise:g} × their spread, correlated between neighboring tokens like COCO photos, seed {int(seed)}."
         )
-    rows = "\n".join(
-        f"| {name}{' (matched)' if streams in (name, 'all') else ''} | {m['cosine']:.3f} | {m['relative_error']:.3f} |"
-        for name, m in metrics.items()
-    )
-    stopped = f" (L-BFGS found no lower loss and stopped before {steps})" if count < steps else ""
+    stopped = [f"{names[run]} after {count[run]}" for run in range(len(runs)) if count[run] < steps]
+    columns = ["run", *(["PSNR"] if original is not None else []), "loss", *map(run_name, stream_names(MODEL))]
+    rows = []
+    for run, streams in enumerate(runs):
+        matched = parse_streams(streams, stream_names(MODEL))
+        # Random targets of streams a run did not match are unrelated noise, so their errors mean nothing.
+        errors = [
+            f"**{m['relative_error']:.3f}**" if name in matched else f"{m['relative_error']:.3f}" if original is not None else "–"
+            for name, m in metrics[run].items()
+        ]
+        score = [f"{psnr(best[run].float() / 255, original):.1f} dB"] if original is not None else []
+        rows.append([names[run], *score, f"{samples[run][0][1]:.3f} → {best_loss[run]:.3f}", *errors])
     summary = (
-        f"{score} Loss {losses[0]:.3f} at the gray start, {best_loss:.3f} at best; "
-        f"{count} evaluations in {seconds:.0f} s{stopped}.\n\n"
-        f"| stream | token cosine | relative error |\n|---|---|---|\n{rows}"
+        f"{header} {sum(count)} evaluations in {seconds:.0f} s"
+        + (f"; L-BFGS found no lower loss and stopped {', '.join(stopped)}" if stopped else "")
+        + ". Loss goes from the gray start to the best image; the last columns are the relative error of each "
+        "stream's tokens, matched ones in bold.\n\n"
+        + "\n".join("| " + " | ".join(row) + " |" for row in [columns, ["---"] * len(columns), *rows])
     )
     video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-    kind = "random" if target == RANDOM else "correlated random"
-    names = ["original", streams] if original is not None else [f"{streams}, {kind} tokens"]
-    write_video(video, original, names, [(torch.stack(frames), list(losses))], list(evaluations))
-    yield as_html(best), summary, video
+    kind = "" if original is not None else " (random)" if target == RANDOM else " (correlated)"
+    write_video(
+        video, original, [label for label, _ in first] + [name + kind for name in names],
+        [(torch.stack([s[0] for s in run_samples]), [s[1] for s in run_samples]) for run_samples in samples],
+        [s[2] for s in max(samples, key=len)],
+    )
+    yield as_html(first + list(zip(names, best))), summary, video
 
 
 with gr.Blocks(title="Qwen3-VL soft-token inversion") as demo:
@@ -181,6 +210,7 @@ with gr.Blocks(title="Qwen3-VL soft-token inversion") as demo:
         "[Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct), then start from a gray "
         "image and optimize it with L-BFGS until its soft tokens match. Watch what the tokens keep. "
         "DeepStack layer 8 usually gives a photo back; the final tokens alone usually stay gray. "
+        "Check several sets of tokens to compare them side by side. "
         "Or start from random tokens, built from the tokens of 200 COCO photos: either their average token "
         "plus Gaussian noise, scaled in each of the 4096 dimensions by how much real tokens vary there, or a "
         "sample along their top principal components, correlated between neighboring tokens like a photo's. "
@@ -193,16 +223,19 @@ with gr.Blocks(title="Qwen3-VL soft-token inversion") as demo:
             with gr.Row(visible=False) as random_in:
                 noise_in = gr.Slider(0, 2, value=1, step=0.05, label="Noise, in standard deviations of real tokens")
                 seed_in = gr.Number(0, precision=0, label="Seed")
-            streams_in = gr.Radio(list(STREAMS), value=next(iter(STREAMS)), label="Soft tokens to match")
+            runs_in = gr.CheckboxGroup(
+                list(RUNS), value=[next(iter(RUNS))], label="Soft tokens to match",
+                info="Each checked option is its own run, one after another, and its own tile in the video.",
+            )
             steps_in = gr.Slider(
-                50, 5000, value=300, step=50, label="L-BFGS evaluations",
+                50, 5000, value=300, step=50, label="L-BFGS evaluations per run",
                 info="30 to 75 ms each on the GPU; long runs can exceed a free account's ZeroGPU limits.",
             )
             size_in = gr.Radio([256, 384], value=256, label="Size in pixels (64 or 144 tokens)")
             run = gr.Button("Reconstruct", variant="primary")
         with gr.Column():
-            image_out = gr.HTML(label="Reconstruction (best so far)", show_label=True, container=True, min_height=300)
-            status = gr.Markdown()
+            image_out = gr.HTML(label="Reconstructions (best so far)", show_label=True, container=True, min_height=150)
+            status = gr.Markdown(elem_id="summary")
             video_out = gr.Video(label="Optimization", show_label=False)  # the label would cover the tile titles
     gr.Examples([f"examples/{name}.png" for name in ["chelsea", "coffee", "astronaut", "testcard"]], inputs=image_in)
     target_in.change(
@@ -210,8 +243,8 @@ with gr.Blocks(title="Qwen3-VL soft-token inversion") as demo:
         target_in, [image_in, random_in],
     )
     run.click(
-        reconstruct, [target_in, image_in, noise_in, seed_in, streams_in, steps_in, size_in], [image_out, status, video_out]
+        reconstruct, [target_in, image_in, noise_in, seed_in, runs_in, steps_in, size_in], [image_out, status, video_out]
     )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(css=CSS)
