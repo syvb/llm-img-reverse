@@ -26,17 +26,21 @@ def sheet(tiles, names, captions=None):
     return out
 
 
-def write_video(path, original, names, runs):
+def write_video(path, original, names, runs, evaluations=None):
     """Write an MP4 of runs optimizing toward `original`, one video frame per evaluation.
 
     `runs` holds (frames, losses) per run: the [E, 3, H, W] uint8 images and the losses that
     --save-frames records. Each tile shows its run's lowest-loss image so far, which skips L-BFGS
-    line-search trials that were rejected. `names` labels the original and then each run. The last
-    frame is held for HOLD_SECONDS.
+    line-search trials that were rejected. `names` labels the original and then each run; when the
+    target tokens came from no image, `original` is None and only the runs are shown, without PSNR.
+    `evaluations` numbers the frames when they are a sample of a longer run (by default frame n is
+    evaluation n + 1). The last frame is held for HOLD_SECONDS.
     """
     best_index = [running_best(list(losses)) for _, losses in runs]
     count = max(len(b) for b in best_index)
-    width, height = original.shape[2] * len(names), original.shape[1] + 2 * STRIP
+    labels = evaluations or range(1, count + 1)
+    height, width = runs[0][0].shape[2:]
+    width, height = width * len(names), height + 2 * STRIP
     ffmpeg = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
          "-r", str(FPS), "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-movflags", "+faststart",
@@ -44,12 +48,14 @@ def write_video(path, original, names, runs):
         stdin=subprocess.PIPE,
     )
     for n in range(count + FPS * HOLD_SECONDS):
-        tiles, captions = [original], [f"evaluation {min(n + 1, count)} / {count}"]
+        progress = f"evaluation {labels[min(n, count - 1)]} / {labels[-1]}"
+        tiles, captions = ([original], [progress]) if original is not None else ([], [])
         for (frames, losses), indices in zip(runs, best_index):
             i = indices[min(n, len(indices) - 1)]
             tile = frames[i].float() / 255
             tiles.append(tile)
-            captions.append(f"{psnr(tile, original):.1f} dB, loss {float(losses[i]):.3f}")
+            score = f"{psnr(tile, original):.1f} dB" if original is not None else progress
+            captions.append(f"{score}, loss {float(losses[i]):.3f}")
         ffmpeg.stdin.write(sheet(tiles, names, captions).tobytes())
     ffmpeg.stdin.close()
     if ffmpeg.wait():

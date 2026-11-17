@@ -4,8 +4,10 @@ Running Qwen3-VL-8B's vision stack backwards: given the soft tokens the vision t
 image, optimize a new image until its soft tokens match them, and look at what comes back.
 
 Try it on a GPU in the [Hugging Face Space](https://huggingface.co/spaces/syvb/qwen3-vl-soft-token-inversion)
-(ZeroGPU; 300 evaluations take about 10 s once it is warm). `space/` holds the app, and
-`HF_TOKEN=... python space/deploy.py <owner>/<space>` deploys it.
+(ZeroGPU; 300 evaluations take about 10 s once it is warm). Besides an image's tokens, it can
+invert random tokens: the mean token of 200 COCO photos plus Gaussian noise, scaled in each dimension
+by the spread of real tokens, which `experiments/token_stats.py` measures. `space/` holds the app,
+and `HF_TOKEN=... python space/deploy.py <owner>/<space>` deploys it.
 
 ## What gets inverted
 

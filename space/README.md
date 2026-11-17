@@ -13,7 +13,9 @@ short_description: Reconstruct images from Qwen3-VL vision soft tokens
 
 Encodes an image with the vision tower of Qwen3-VL-8B-Instruct, then optimizes a new image from gray
 until its soft tokens match: the final tokens the LLM reads, one of the three DeepStack streams, or
-all four. Code, method and CPU results: https://github.com/syvb/llm-img-reverse
+all four. It can also invert random tokens, the mean token of COCO photos plus noise
+(`token_stats.pt`, from `experiments/token_stats.py`). Code, method and CPU results:
+https://github.com/syvb/llm-img-reverse
 
 This folder is deployed with `python space/deploy.py <owner>/<space>`, which uploads it together
 with the `llm_img_reverse` package and the example images.
