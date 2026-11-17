@@ -27,9 +27,9 @@ def load_vision_tower(model_id=MODEL_ID, dtype=torch.float32, device="cpu"):
         with safe_open(hf_hub_download(model_id, shard), "pt") as f:
             for key in f.keys():
                 if key.startswith(PREFIX):
-                    state[key[len(PREFIX) :]] = f.get_tensor(key).to(dtype)
+                    state[key[len(PREFIX) :]] = f.get_tensor(key)
     model = Qwen3VLVisionModel(config).to(dtype)
-    model.load_state_dict(state, strict=True)
+    model.load_state_dict(state, strict=True)  # copies the bf16 checkpoint into `dtype`
     return model.to(device).eval().requires_grad_(False)
 
 
