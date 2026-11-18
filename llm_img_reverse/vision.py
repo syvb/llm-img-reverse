@@ -1,5 +1,6 @@
 """Qwen3-VL vision tower: weight loading, differentiable preprocessing, and encoding."""
 
+import functools
 import json
 
 import numpy as np
@@ -51,7 +52,20 @@ def to_pixel_values(image, config):
     x = ((image - MEAN) / STD).unsqueeze(0).expand(t, c, h, w)  # a still image fills both frames
     x = x.reshape(t, c, gh // m, m, p, gw // m, m, p)
     x = x.permute(2, 5, 3, 6, 1, 0, 4, 7)  # merge blocks, then 2x2 patches, then C, T, P, P
-    return x.reshape(gh * gw, c * t * p * p), torch.tensor([[1, gh, gw]], device=image.device)
+    return x.reshape(gh * gw, c * t * p * p), torch.tensor([[1, gh, gw]])
+
+
+@functools.lru_cache(maxsize=16)
+@torch.no_grad()
+def geometry(model, grid_h, grid_w):
+    """The position embeddings and rotary (cos, sin) for a grid of patches, which depend only on its size.
+
+    Computing them takes several CPU-GPU syncs, so encode reuses them; then an evaluation has none.
+    """
+    grid_thw = torch.tensor([[1, grid_h, grid_w]])
+    rotary = model.rot_pos_emb(grid_thw).reshape(grid_h * grid_w, -1)
+    emb = torch.cat((rotary, rotary), dim=-1)
+    return model.fast_pos_embed_interpolate(grid_thw), (emb.cos(), emb.sin())
 
 
 def encode(model, image, streams=None):
@@ -67,11 +81,14 @@ def encode(model, image, streams=None):
     last_block = max(len(model.blocks) - 1 if s == "main" else ds_layers[s] for s in streams)
 
     pixel_values, grid_thw = to_pixel_values(image, model.config)
-    hidden = model.patch_embed(pixel_values) + model.fast_pos_embed_interpolate(grid_thw)
-    rotary = model.rot_pos_emb(grid_thw).reshape(hidden.shape[0], -1)
-    emb = torch.cat((rotary, rotary), dim=-1)
-    position_embeddings = (emb.cos(), emb.sin())
-    cu_seqlens = torch.tensor([0, hidden.shape[0]], dtype=torch.int32, device=hidden.device)
+    pos_embeds, position_embeddings = geometry(model, *grid_thw[0, 1:].tolist())
+    # The patch embedding is a Conv3d whose stride equals its kernel: a matmul over the flattened
+    # patches, which is the same and much faster to differentiate.
+    proj = model.patch_embed.proj
+    hidden = torch.nn.functional.linear(pixel_values, proj.weight.flatten(1), proj.bias) + pos_embeds
+    # The SDPA attention only reads cu_seqlens to split the sequence into images, with .tolist(); on the
+    # CPU that needs no sync.
+    cu_seqlens = torch.tensor([0, hidden.shape[0]], dtype=torch.int32)
 
     out = {}
     for layer, block in enumerate(model.blocks[: last_block + 1]):

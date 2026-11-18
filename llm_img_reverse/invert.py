@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import torch
+from torch.optim.lbfgs import _strong_wolfe
 
 from .vision import encode, load_image, load_vision_tower, save_image, stream_names
 
@@ -71,6 +72,96 @@ class PixelImage(torch.nn.Module):
 PARAMETERIZATIONS = {"fourier": FourierImage, "pixel": PixelImage}
 
 
+def cuda_graph(fn, warmup=2):
+    """Capture `fn`, which takes no arguments, in a CUDA graph and return a function that replays it.
+
+    A replay launches all of fn's kernels at once, without Python or per-kernel launch overhead, which
+    dominates at these small sizes. It returns the same output tensors every time, overwritten by the
+    next replay, and computes from whatever the tensors fn read hold then, such as updated parameters.
+    """
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):  # outside the capture, select kernels and allocate workspaces
+        for _ in range(warmup):
+            fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    # Only this thread is checked for calls that break capture, so concurrent runs (ZeroGPU runs
+    # handlers in parallel) can keep working while one captures.
+    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+        outputs = fn()
+
+    def replay():
+        graph.replay()
+        return outputs
+
+    return replay
+
+
+@torch.no_grad()
+def lbfgs(closure, param, max_eval, lr=1.0, history_size=50):
+    """Minimize closure() over the tensor `param` with L-BFGS in at most `max_eval` evaluations.
+
+    The steps of torch.optim.LBFGS with line_search_fn="strong_wolfe" and zero tolerances. Its two-loop
+    recursion makes the CPU wait for the GPU twice per stored pair, about 4 ms a step on the Space's
+    GPU; here the history is a fixed buffer whose unused rows are zero, which change nothing, so the
+    recursion has no syncs and on CUDA runs as one graph. `closure` returns the loss and leaves the
+    gradient in param.grad.
+    """
+    size = param.numel()
+    steps, changes = param.new_zeros(history_size, size), param.new_zeros(history_size, size)  # oldest first
+    rho, gamma, grad = param.new_zeros(history_size), param.new_ones(()), param.new_zeros(size)
+
+    def two_loop():  # the direction -H grad, with H the inverse Hessian estimate from the history
+        q, alpha = grad.neg(), [None] * history_size
+        for i in reversed(range(history_size)):
+            alpha[i] = steps[i].dot(q) * rho[i]
+            q.addcmul_(changes[i], alpha[i], value=-1)
+        r = q * gamma
+        for i in range(history_size):
+            r.addcmul_(steps[i], alpha[i] - changes[i].dot(r) * rho[i])
+        return r
+
+    if param.is_cuda:
+        two_loop = cuda_graph(two_loop)
+
+    def evaluate(x, t, d):  # loss and gradient at x + t d, for the line search
+        param.copy_(x + t * d.view_as(param))
+        with torch.enable_grad():
+            loss = float(closure())
+        return loss, param.grad.flatten().clone()
+
+    with torch.enable_grad():
+        loss = float(closure())
+    flat_grad, evals, first = param.grad.flatten().clone(), 1, True
+    if flat_grad.abs().max() == 0:
+        return
+    while True:
+        if first:
+            d = flat_grad.neg()
+            t = min(1.0, 1.0 / flat_grad.abs().sum()) * lr
+        else:
+            change, step = flat_grad - prev_grad, d * t
+            curvature = change.dot(step)
+            if curvature > 1e-10:
+                for buffer, new in [(steps, step), (changes, change), (rho, 1 / curvature)]:
+                    buffer[:-1] = buffer[1:].clone()
+                    buffer[-1] = new
+                gamma.copy_(curvature / change.dot(change))
+            grad.copy_(flat_grad)
+            d, t = two_loop(), lr
+        first, prev_grad = False, flat_grad
+        slope = flat_grad.dot(d)
+        if slope > 0:
+            return
+        x = param.clone()
+        loss, flat_grad, t, line_evals = _strong_wolfe(evaluate, x, t, d, loss, flat_grad, slope, max_ls=max_eval - evals)
+        param.copy_(x + t * d.view_as(param))
+        evals += line_evals
+        if evals >= max_eval or flat_grad.abs().max() == 0 or (d * t).abs().max() == 0:
+            return
+
+
 def invert(
     model, targets, shape, weights, steps=300, optimizer="lbfgs", lr=None, tv=0.0, param="fourier", seed=0,
     log_every=25, log=lambda line: print(line, flush=True), on_eval=None,
@@ -78,34 +169,41 @@ def invert(
     """Find a [3, H, W] image in [0, 1] whose soft tokens match `targets` on the weighted streams.
 
     `steps` counts evaluations of the vision tower (forward and backward), for either optimizer.
-    `on_eval(image, loss)` is called after each one; with L-BFGS this includes line-search trials.
+    `on_eval(image, loss)` is called after each one; with L-BFGS this includes line-search trials. On
+    CUDA the image tensor is overwritten by the next evaluation, so copy what you keep.
     """
     # Initialized on the CPU generator so a seed gives the same start on every device.
     device = next(iter(targets.values())).device
     image_fn = PARAMETERIZATIONS[param](shape, torch.Generator().manual_seed(seed)).to(device)
     history = []
 
-    def closure():
+    def evaluate():
+        """The image, loss and per-stream errors at the current parameters, and the gradient in .grad."""
+        image_fn.zero_grad()
         image = image_fn()
         tokens = encode(model, image, streams=list(weights))
         errors = {name: relative_error(tokens[name], targets[name]) for name in weights}
         loss = sum(w * errors[name] for name, w in weights.items()) + tv * total_variation(image)
-        opt.zero_grad()
         loss.backward()
+        return image.detach(), loss.detach(), {name: error.detach() for name, error in errors.items()}
+
+    if device.type == "cuda":
+        with torch.enable_grad():
+            evaluate = cuda_graph(evaluate)
+
+    def closure():
+        image, loss, errors = evaluate()
         evaluation = len(history) + 1
         history.append({"eval": evaluation, "loss": loss.item(), **{k: v.item() for k, v in errors.items()}})
         if evaluation % log_every == 0:
             log(" ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in history[-1].items()))
         if on_eval:
-            on_eval(image.detach(), loss.item())
+            on_eval(image, loss.item())
         return loss
 
     if optimizer == "lbfgs":
-        opt = torch.optim.LBFGS(
-            image_fn.parameters(), lr=lr or 1, max_iter=steps, max_eval=steps, history_size=50,
-            line_search_fn="strong_wolfe", tolerance_grad=0, tolerance_change=0,
-        )
-        opt.step(closure)
+        (param,) = image_fn.parameters()
+        lbfgs(closure, param, steps, lr=lr or 1)
     else:
         opt = torch.optim.Adam(image_fn.parameters(), lr=lr or 0.05)
         schedule = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / steps)))

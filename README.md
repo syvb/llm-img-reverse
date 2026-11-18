@@ -4,7 +4,7 @@ Running Qwen3-VL-8B's vision stack backwards: given the soft tokens the vision t
 image, optimize a new image until its soft tokens match them, and look at what comes back.
 
 Try it on a GPU in the [Hugging Face Space](https://huggingface.co/spaces/syvb/qwen3-vl-soft-token-inversion)
-(ZeroGPU; 300 evaluations take about 10 s once it is warm). Besides an image's tokens, it can
+(ZeroGPU; 300 evaluations of deepstack 8 take about 6 s once it is warm). Besides an image's tokens, it can
 invert random tokens built from statistics of 200 COCO photos' tokens, which
 `experiments/token_stats.py` measures (see [Random targets](#random-targets)). `space/` holds the
 app, and `HF_TOKEN=... python space/deploy.py <owner>/<space>` deploys it.
@@ -134,5 +134,5 @@ ds8 tokens onto the top 64 or 256 components and inverting that for 120 evaluati
 ## CPU notes
 
 On 4 cores, one forward and backward pass at 256×256 takes about 1.5 s through the whole tower and
-about 0.55 s up to block 8, so 300 steps take about 3 minutes for ds8 and 7 to 8 for main or all.
+about 0.45 s up to block 8, so 300 steps take 2 to 3 minutes for ds8 and 7 to 8 for main or all.
 Each run peaks at about 3.4 GB of RAM; four runs at once ran out of memory on a 15 GB machine.

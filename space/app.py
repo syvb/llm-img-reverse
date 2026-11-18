@@ -45,8 +45,8 @@ VIDEO_FRAMES = 600  # longer runs are sampled down to this many video frames
 
 def gpu_seconds(size, runs, steps, original=None, targets=None):
     """GPU time to reserve: 15 s to start, plus 1.5 times what an evaluation took on the Space, about
-    30 ms up to block 8 and 50 ms (256 px) or 75 ms (384 px) through the whole tower, for every run."""
-    per_eval = sum(0.03 if streams == "ds8" else 0.05 if size == 256 else 0.075 for streams in runs)
+    12 ms (256 px) or 22 ms (384 px) up to block 8 and 30 or 60 ms through the whole tower, for every run."""
+    per_eval = sum((0.012 if size == 256 else 0.022) if streams == "ds8" else 0.03 if size == 256 else 0.06 for streams in runs)
     return int(15 + 1.5 * steps * per_eval)
 
 
@@ -229,7 +229,7 @@ with gr.Blocks(title="Qwen3-VL soft-token inversion") as demo:
             )
             steps_in = gr.Slider(
                 50, 5000, value=300, step=50, label="L-BFGS evaluations per run",
-                info="30 to 75 ms each on the GPU; long runs can exceed a free account's ZeroGPU limits.",
+                info="12 to 60 ms each on the GPU; long runs can exceed a free account's ZeroGPU limits.",
             )
             size_in = gr.Radio([256, 384], value=256, label="Size in pixels (64 or 144 tokens)")
             run = gr.Button("Reconstruct", variant="primary")
