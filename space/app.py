@@ -14,7 +14,7 @@ import spaces
 import torch
 from PIL import Image
 
-from llm_img_reverse.invert import invert, parse_streams, psnr, token_metrics
+from llm_img_reverse.invert import DEFAULT_LR, invert, parse_streams, psnr, token_metrics
 from llm_img_reverse.video import run_name, write_video
 from llm_img_reverse.vision import encode, load_image, load_vision_tower, stream_names
 
@@ -37,22 +37,25 @@ RUNS = {
     "main: final soft tokens (the LLM's input)": "main",
     "all four, matched together": "all",
 }
+# Radio label -> the optimizer's name in invert.
+OPTIMIZERS = {"L-BFGS": "lbfgs", "Adam": "adam", "Muon": "muon"}
 PREVIEW_SECONDS = 0.25
 # A compact summary table, so that its columns fit beside the inputs without breaking words.
 CSS = "#summary table { font-size: 13px } #summary th, #summary td { padding: 4px 6px; white-space: nowrap } #summary { overflow-x: auto }"
 VIDEO_FRAMES = 600  # longer runs are sampled down to this many video frames
 
 
-def gpu_seconds(size, runs, steps, original=None, targets=None):
+def gpu_seconds(size, runs, steps, optimizer, lr, original=None, targets=None):
     """GPU time to reserve: 15 s to start, plus 1.5 times what an evaluation took on the Space, about
-    12 ms (256 px) or 22 ms (384 px) up to block 8 and 30 or 60 ms through the whole tower, for every run."""
+    12 ms (256 px) or 22 ms (384 px) up to block 8 and 30 or 60 ms through the whole tower, for every run
+    and with any optimizer."""
     per_eval = sum((0.012 if size == 256 else 0.022) if streams == "ds8" else 0.03 if size == 256 else 0.06 for streams in runs)
     return int(15 + 1.5 * steps * per_eval)
 
 
 @spaces.GPU(duration=gpu_seconds)
-def optimize(size, runs, steps, original=None, targets=None):
-    """Run one inversion per entry of `runs`, the streams it matches such as "ds8" or "all", one after
+def optimize(size, runs, steps, optimizer, lr, original=None, targets=None):
+    """Run one inversion with `optimizer` and `lr` (None for its default) per entry of `runs`, the streams it matches such as "ds8" or "all", one after
     another. Yield (run, uint8 frame, loss) after each evaluation and (run, dict of token metrics) when a
     run ends. The target tokens are those of the image `original`, or `targets` when there is no image."""
     with torch.no_grad():
@@ -68,7 +71,7 @@ def optimize(size, runs, steps, original=None, targets=None):
                     updates.put((run, (image.clamp(0, 1) * 255).round().to(torch.uint8).cpu(), loss))
 
                 weights = parse_streams(streams, stream_names(MODEL))
-                image, _ = invert(MODEL, targets, (3, size, size), weights, steps, on_eval=record)
+                image, _ = invert(MODEL, targets, (3, size, size), weights, steps, optimizer=optimizer, lr=lr, on_eval=record)
                 updates.put((run, token_metrics(MODEL, image, targets)))
             updates.put(None)
         except Exception as error:  # surfaced in the generator below
@@ -127,10 +130,17 @@ def correlated_targets(size, noise, seed):
     return targets
 
 
-def reconstruct(target, path, noise, seed, run_labels, steps, size):
+def reconstruct(target, path, noise, seed, run_labels, optimizer_label, lr, steps, size):
     runs = [streams for label, streams in RUNS.items() if label in run_labels]
     if not runs:
         raise gr.Error("Check at least one set of soft tokens to match.")
+    optimizer = OPTIMIZERS[optimizer_label]
+    if optimizer == "lbfgs":
+        lr, method = None, "L-BFGS"
+    elif not lr or lr <= 0:
+        raise gr.Error("The learning rate must be above 0.")
+    else:
+        method = f"{optimizer_label}, learning rate {lr:g} decaying along a cosine"
     size, steps = int(size), int(steps)
     original = targets = None
     if target == IMAGE:
@@ -147,7 +157,7 @@ def reconstruct(target, path, noise, seed, run_labels, steps, size):
     stride, samples = -(-steps // VIDEO_FRAMES), [[] for _ in runs]
     start = time.time()
     last_preview = start - PREVIEW_SECONDS  # show the first frame right away
-    for run, *item in optimize(size, runs, steps, original=original, targets=targets):
+    for run, *item in optimize(size, runs, steps, optimizer, lr, original=original, targets=targets):
         if len(item) == 1:  # the run ended
             metrics[run] = item[0]
             if samples[run][-1][2] != count[run]:
@@ -187,16 +197,17 @@ def reconstruct(target, path, noise, seed, run_labels, steps, size):
         score = [f"{psnr(best[run].float() / 255, original):.1f} dB"] if original is not None else []
         rows.append([names[run], *score, f"{samples[run][0][1]:.3f} → {best_loss[run]:.3f}", *errors])
     summary = (
-        f"{header} {sum(count)} evaluations in {seconds:.0f} s"
+        f"{header} {sum(count)} evaluations in {seconds:.0f} s with {method}"
         + (f"; L-BFGS found no lower loss and stopped {', '.join(stopped)}" if stopped else "")
         + ". Loss goes from the gray start to the best image; the last columns are the relative error of each "
         "stream's tokens, matched ones in bold.\n\n"
         + "\n".join("| " + " | ".join(row) + " |" for row in [columns, ["---"] * len(columns), *rows])
     )
     video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-    kind = "" if original is not None else " (random)" if target == RANDOM else " (correlated)"
+    tags = [tag for tag in ({RANDOM: "random", CORRELATED: "correlated"}.get(target), optimizer != "lbfgs" and optimizer_label) if tag]
+    suffix = f" ({', '.join(tags)})" if tags else ""
     write_video(
-        video, original, [label for label, _ in first] + [name + kind for name in names],
+        video, original, [label for label, _ in first] + [name + suffix for name in names],
         [(torch.stack([s[0] for s in run_samples]), [s[1] for s in run_samples]) for run_samples in samples],
         [s[2] for s in max(samples, key=len)],
     )
@@ -208,8 +219,9 @@ with gr.Blocks(title="Qwen3-VL soft-token inversion") as demo:
         "# Running Qwen3-VL's vision stack backwards\n"
         "Encode an image with the vision tower of "
         "[Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct), then start from a gray "
-        "image and optimize it with L-BFGS until its soft tokens match. Watch what the tokens keep. "
-        "DeepStack layer 8 usually gives a photo back; the final tokens alone usually stay gray. "
+        "image and optimize it with L-BFGS, Adam or Muon until its soft tokens match. Watch what the tokens keep. "
+        "DeepStack layer 8 usually gives a photo back. The final tokens alone stay gray with L-BFGS; Muon gets "
+        "the cat back from them after about 2000 evaluations. "
         "Check several sets of tokens to compare them side by side. "
         "Or start from random tokens, built from the tokens of 200 COCO photos: either their average token "
         "plus Gaussian noise, scaled in each of the 4096 dimensions by how much real tokens vary there, or a "
@@ -227,8 +239,15 @@ with gr.Blocks(title="Qwen3-VL soft-token inversion") as demo:
                 list(RUNS), value=[next(iter(RUNS))], label="Soft tokens to match",
                 info="Each checked option is its own run, one after another, and its own tile in the video.",
             )
+            with gr.Row():
+                optimizer_in = gr.Radio(
+                    list(OPTIMIZERS), value="L-BFGS", label="Optimizer", scale=3,
+                    info="L-BFGS stops early once it finds no lower loss. Adam and Muon take every step, with the "
+                    "learning rate decaying along a cosine; Muon orthogonalizes each step of the image's spectrum.",
+                )
+                lr_in = gr.Number(DEFAULT_LR["adam"], minimum=0, step=0.0001, label="Learning rate", visible=False, scale=1)
             steps_in = gr.Slider(
-                50, 5000, value=300, step=50, label="L-BFGS evaluations per run",
+                50, 5000, value=300, step=50, label="Evaluations per run",
                 info="12 to 60 ms each on the GPU; long runs can exceed a free account's ZeroGPU limits.",
             )
             size_in = gr.Radio([256, 384], value=256, label="Size in pixels (64 or 144 tokens)")
@@ -242,8 +261,12 @@ with gr.Blocks(title="Qwen3-VL soft-token inversion") as demo:
         lambda target: (gr.update(visible=target == IMAGE), gr.update(visible=target != IMAGE)),
         target_in, [image_in, random_in],
     )
+    optimizer_in.change(
+        lambda label: gr.update(visible=label != "L-BFGS", value=DEFAULT_LR[OPTIMIZERS[label]]), optimizer_in, lr_in
+    )
     run.click(
-        reconstruct, [target_in, image_in, noise_in, seed_in, runs_in, steps_in, size_in], [image_out, status, video_out]
+        reconstruct, [target_in, image_in, noise_in, seed_in, runs_in, optimizer_in, lr_in, steps_in, size_in],
+        [image_out, status, video_out],
     )
 
 if __name__ == "__main__":

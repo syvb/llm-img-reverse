@@ -27,7 +27,8 @@ the tower at the last block those streams need.
 `llm_img_reverse/invert.py` minimizes the relative squared error between the image's tokens and the
 targets, summed over the chosen streams with weights. By default it runs L-BFGS over a 1/f-scaled
 Fourier spectrum in decorrelated color space (the parameterization from Olah et al., *Feature
-Visualization*, 2017). With plain pixels, or with Adam, the result is mostly edges on top of noise.
+Visualization*, 2017). With plain pixels the result is mostly edges on top of noise. Adam and Muon
+are also available; see [Optimizers](#optimizers).
 
 ## Usage
 
@@ -50,8 +51,8 @@ python -m llm_img_reverse.invert chelsea.pt --streams all --out results/chelsea_
 Each run writes `reconstruction.png`, `comparison.png` (original next to the reconstruction, for
 image inputs) and `metrics.json` (PSNR, and the relative error and mean cosine similarity of every
 stream, including those that were not optimized). `--save-frames` also saves every evaluated image
-to `frames.pt` (about 60 MB for 300 evaluations at 256×256). `--param pixel`, `--optimizer adam`,
-`--tv` and `--lr` switch to the baselines and regularizers.
+to `frames.pt` (about 60 MB for 300 evaluations at 256×256). `--param pixel`, `--optimizer adam` or
+`muon`, `--tv` and `--lr` switch to the baselines, other optimizers and regularizers.
 
 `experiments/cpu_sweep.sh` reruns the CPU tests below, and `experiments/summarize.py` builds the
 table, contact sheets and videos from any directory of runs.
@@ -99,7 +100,7 @@ older `huggingface_hub`):
 - **Detail fades with depth.** On the test card, ds16 keeps fuzzy shapes and colors and ds24 only
   faint colored blobs.
 - **Matching main alone fails from a gray start**: the result stays gray. This is the optimizer,
-  not missing information. Images reconstructed from the DeepStack streams match main far better
+  not missing information: Muon gets the cat back from main (see [Optimizers](#optimizers)). Images reconstructed from the DeepStack streams match main far better
   than what optimizing main directly finds (test card error 0.16 to 0.41 against 0.74; cat 0.05
   against 0.65). In 100-step trials on the test card, per-token-normalized and cosine losses, Adam
   at learning rates 0.05 and 0.2, and optimizing a 16×16 or 64×64 image upsampled to full size
@@ -112,6 +113,28 @@ main hard. Adding 2% pixel noise changes main about 2 to 4 times as much as it c
 DeepStack streams, and 8 of main's 64 tokens hold 40 to 60% of its energy. One explanation, which
 these runs have not tested, is that local search finds noise-like changes that move main faster
 than real image content does.
+
+## Optimizers
+
+Besides L-BFGS, `invert.py` and the Space can use Adam or Muon (Jordan et al., 2024), both with the
+learning rate decaying to 0 along a cosine. torch.optim.Muon only takes 2D real parameters, so
+`invert.Muon` orthogonalizes each color channel's Fourier spectrum as a complex matrix over vertical
+and horizontal frequencies. Their default learning rates, 0.003 for Adam and 0.001 for Muon, did best
+in a sweep on the cat at 256 px. On the Space's GPU, with the best image's loss:
+
+| matched | evaluations | L-BFGS | Adam | Muon |
+|---|---|---|---|---|
+| ds8 | 300 | **0.006** (22.9 dB) | 0.048 | 0.025 (19.8 dB) |
+| ds8 | 2000 | **0.0018** (24.8 dB, stopped at 1682) | 0.0069 (19.3 dB) | 0.0019 (23.9 dB) |
+| main | 300 | 0.73 (15.1 dB, stopped at 253) | 0.20 | **0.10** |
+| main | 2000 | – | – | **0.010** (15.6 dB) |
+
+- **On ds8, L-BFGS is best**, and Muon catches up by 2000 evaluations. Adam's cat stays washed out.
+- **On main, Muon reaches a loss 70 times lower than L-BFGS does.** After 300 evaluations its image
+  is colorful patterns unlike the cat; after 2000 the cat's eyes, nose and fur come back through a
+  noisy texture, though its PSNR (15.6 dB) is barely above flat gray (15.0).
+
+![Original; ds8 with L-BFGS, Muon and Adam; main with Muon; 2000 evaluations each](results/optimizers.jpg)
 
 ## Random targets
 

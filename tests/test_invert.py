@@ -5,7 +5,10 @@ from llm_img_reverse.invert import invert, lbfgs, relative_error
 from llm_img_reverse.vision import encode
 
 
-@pytest.mark.parametrize("optimizer,param", [("lbfgs", "fourier"), ("lbfgs", "pixel"), ("adam", "fourier"), ("adam", "pixel")])
+@pytest.mark.parametrize(
+    "optimizer,param",
+    [("lbfgs", "fourier"), ("lbfgs", "pixel"), ("adam", "fourier"), ("adam", "pixel"), ("muon", "fourier"), ("muon", "pixel")],
+)
 def test_invert_moves_tokens_toward_targets(tiny_tower, optimizer, param):
     torch.manual_seed(1)
     original = torch.rand(3, 64, 64)
@@ -13,7 +16,9 @@ def test_invert_moves_tokens_toward_targets(tiny_tower, optimizer, param):
         targets = encode(tiny_tower, original)
         start = relative_error(encode(tiny_tower, torch.full_like(original, 0.5))["ds1"], targets["ds1"]).item()
 
-    image, _ = invert(tiny_tower, targets, original.shape, {"ds1": 1.0}, steps=40, optimizer=optimizer, param=param, log=lambda _: None)
+    # The default learning rates are tuned for the real tower; this small random one needs larger steps.
+    lr = None if optimizer == "lbfgs" else 0.03
+    image, _ = invert(tiny_tower, targets, original.shape, {"ds1": 1.0}, steps=40, optimizer=optimizer, param=param, lr=lr, log=lambda _: None)
 
     assert image.shape == original.shape and 0 <= image.min() and image.max() <= 1
     with torch.no_grad():

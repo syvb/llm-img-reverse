@@ -1,7 +1,8 @@
 """Reconstruct an image from Qwen3-VL soft tokens by optimizing an image until its tokens match.
 
 By default L-BFGS optimizes a 1/f-scaled Fourier spectrum in decorrelated color space; --param pixel
-and --optimizer adam are the naive baselines, which mostly recover edges and noise.
+and --optimizer adam are the naive baselines, which mostly recover edges and noise; --optimizer muon
+orthogonalizes each update.
 
     python -m llm_img_reverse.invert examples/testcard.png --streams main --out results/testcard_main
     python -m llm_img_reverse.invert tokens.pt --streams ds8 --out results/edited
@@ -70,6 +71,7 @@ class PixelImage(torch.nn.Module):
 
 
 PARAMETERIZATIONS = {"fourier": FourierImage, "pixel": PixelImage}
+DEFAULT_LR = {"lbfgs": 1.0, "adam": 0.003, "muon": 0.001}  # tuned on the cat at 256 px, 300 to 2000 evaluations
 
 
 def cuda_graph(fn, warmup=2):
@@ -162,13 +164,54 @@ def lbfgs(closure, param, max_eval, lr=1.0, history_size=50):
             return
 
 
+def orthogonalize(x, steps=5):
+    """Each matrix of x [..., m, n], real or complex, mapped to about the nearest semi-orthogonal one
+    (U V^H from its SVD): Muon's quintic Newton-Schulz iteration. It keeps the singular vectors and
+    moves the singular values to about 0.7 to 1.2, except those far below the largest."""
+    a, b, c = 3.4445, -4.7750, 2.0315
+    wide = x.shape[-2] <= x.shape[-1]
+    x = x if wide else x.mH
+    x = x / (torch.linalg.matrix_norm(x, keepdim=True) + 1e-7)
+    for _ in range(steps):
+        gram = x @ x.mH
+        x = a * x + (b * gram + c * gram @ gram) @ x
+    return x if wide else x.mH
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon (Jordan et al., 2024): SGD with Nesterov momentum whose update for each matrix is replaced by
+    the nearest semi-orthogonal one, so every direction of it moves the same distance.
+
+    torch.optim.Muon only takes 2D real parameters. Here `matrices` views a tensor shaped like a parameter
+    as a batch of matrices [..., m, n], real or complex, which are orthogonalized one by one. The step is
+    scaled by sqrt(max(m, n)), so its entries have a root mean square of about lr, like Adam's steps.
+    """
+
+    def __init__(self, params, lr, momentum=0.95, matrices=lambda t: t):
+        super().__init__(params, {"lr": lr, "momentum": momentum})
+        self.matrices = matrices
+
+    @torch.no_grad()
+    def step(self, closure):
+        with torch.enable_grad():
+            loss = closure()
+        for group in self.param_groups:
+            for p in group["params"]:
+                momentum = self.state[p].setdefault("momentum", torch.zeros_like(p))
+                momentum.mul_(group["momentum"]).add_(p.grad)
+                update = self.matrices(p.grad + group["momentum"] * momentum)
+                self.matrices(p).add_(orthogonalize(update), alpha=-group["lr"] * max(update.shape[-2:]) ** 0.5)
+        return loss
+
+
 def invert(
     model, targets, shape, weights, steps=300, optimizer="lbfgs", lr=None, tv=0.0, param="fourier", seed=0,
     log_every=25, log=lambda line: print(line, flush=True), on_eval=None,
 ):
     """Find a [3, H, W] image in [0, 1] whose soft tokens match `targets` on the weighted streams.
 
-    `steps` counts evaluations of the vision tower (forward and backward), for either optimizer.
+    `steps` counts evaluations of the vision tower (forward and backward), for any optimizer. Adam and
+    Muon take one step per evaluation, with the learning rate decaying to 0 along a cosine.
     `on_eval(image, loss)` is called after each one; with L-BFGS this includes line-search trials. On
     CUDA the image tensor is overwritten by the next evaluation, so copy what you keep.
     """
@@ -203,9 +246,15 @@ def invert(
 
     if optimizer == "lbfgs":
         (param,) = image_fn.parameters()
-        lbfgs(closure, param, steps, lr=lr or 1)
+        lbfgs(closure, param, steps, lr=lr or DEFAULT_LR["lbfgs"])
     else:
-        opt = torch.optim.Adam(image_fn.parameters(), lr=lr or 0.05)
+        if optimizer == "adam":
+            opt = torch.optim.Adam(image_fn.parameters(), lr=lr or DEFAULT_LR["adam"])
+        else:
+            # A Fourier image's update is orthogonalized per color channel, as a complex matrix over
+            # vertical and horizontal frequencies; plain pixels per color channel, as a real matrix.
+            matrices = torch.view_as_complex if param == "fourier" else (lambda t: t)
+            opt = Muon(image_fn.parameters(), lr=lr or DEFAULT_LR["muon"], matrices=matrices)
         schedule = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / steps)))
         for _ in range(steps):
             opt.step(closure)
@@ -256,8 +305,8 @@ def main():
     parser.add_argument("--size", default="256", help="HxW (or one number for square), multiples of 32")
     parser.add_argument("--streams", default="main", help="streams to match: main, ds8, ds16, ds24, comma list with =weight, or all")
     parser.add_argument("--steps", type=int, default=300, help="forward/backward evaluations of the vision tower")
-    parser.add_argument("--optimizer", choices=["lbfgs", "adam"], default="lbfgs")
-    parser.add_argument("--lr", type=float, help="learning rate (default 1 for lbfgs, 0.05 for adam)")
+    parser.add_argument("--optimizer", choices=list(DEFAULT_LR), default="lbfgs")
+    parser.add_argument("--lr", type=float, help="learning rate (default: " + ", ".join(f"{v:g} for {k}" for k, v in DEFAULT_LR.items()) + ")")
     parser.add_argument("--tv", type=float, default=0.0, help="total variation weight")
     parser.add_argument("--param", choices=list(PARAMETERIZATIONS), default="fourier", help="how the image is optimized")
     parser.add_argument("--seed", type=int, default=0)
